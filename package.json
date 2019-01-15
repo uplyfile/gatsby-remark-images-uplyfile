@@ -1,0 +1,21 @@
+{
+    "name": "gatsby-remark-images-uplyfile",
+    "description": "Remark plugin for gatsby using uplyfile images serving. https://uplyfile.com",
+    "version": "0.0.1",
+    "bugs": {
+        "url": "https://github.com/uplyfile/gatsby-remark-images-uplyfile/issues"
+    },
+    "dependencies": {
+        "cheerio": "^1.0.0-rc.2",
+        "unist-util-select": "^1.5.0"
+    },
+    "keywords": [
+        "favicon",
+        "gatsby",
+        "gatsby-plugin",
+        "images",
+        "seo",
+        "remark",
+        "uplyfile"
+    ]
+}
