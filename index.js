@@ -1,10 +1,13 @@
 // const select = require(`unist-util-select`)
+const _ = require(`lodash`)
 const cheerio = require(`cheerio`)
+const fetch = require("node-fetch")
 const isRelativeUrl = require(`is-relative-url`)
 const path = require(`path`)
 const slash = require(`slash`)
 const visitWithParents = require(`unist-util-visit-parents`)
-const _ = require(`lodash`)
+
+const {fluid, getImageDimentions, createSignature} = require(`../gatsby-plugin-uplyfile`)
 
 
 module.exports = async (
@@ -20,18 +23,73 @@ module.exports = async (
 
     // This will allow the use of html image tags
     // const rawHtmlNodes = select(markdownAST, `html`)
-    let rawHtmlNodes = []
-    visitWithParents(markdownAST, `html`, (node, ancestors) => {
+    // let rawHtmlNodes = []
+    // visitWithParents(markdownAST, `html`, (node, ancestors) => {
+    //     const inLink = ancestors.some(findParentLinks)
+
+    //     rawHtmlNodes.push({ node, inLink })
+    // })
+
+    // console.log("rawHtmlNodes", rawHtmlNodes)
+
+  let markdownImageNodes = []
+    visitWithParents(markdownAST, `image`, (node, ancestors) => {
         const inLink = ancestors.some(findParentLinks)
 
-        rawHtmlNodes.push({ node, inLink })
+        markdownImageNodes.push({ node, inLink })
     })
 
-    const generateImagesAndUpdateNode = async function(node, resolve, inLink) {
+    var now = new Date();
+    var later = new Date();
+    later.setHours(now.getHours() + 2);
+    let expires = +later
+    let uplySignature = createSignature(pluginOptions.secretKey, expires)
+
+    var uplyfileSeverListCache = await cache.get("gatsby-remark-images-uplyfile-cache")
+
+
+    if (uplyfileSeverListCache === undefined) {
+        let response = await fetch(
+            "https://uplycdn.com/api/v1/files/",
+            // "http://localhost:8001/api/v1/files/",
+            {
+                headers: {
+                    "Content-Type": "application/json",
+                    "Uply-Public-Key": pluginOptions.publicKey,
+                    "Uply-Signature": uplySignature,
+                    "Uply-Expires": expires,
+                }
+            }
+        );
+        if (response.status != 200) {
+            if (response.status == 403) {
+                let error = await response.json()
+                console.log("ERROR:", error)
+                throw `Uplyfile files list endpoint returned ${response.status}.`
+
+            }
+            throw `Uplyfile files list endpoint returned ${response.status}.`
+        }
+        let filesList = await response.json()
+
+        uplyfileSeverListCache = {}
+        for (var i in filesList) {
+            let file = filesList[i]
+            uplyfileSeverListCache[file.etag] = file.url
+        }
+
+        await cache.set("gatsby-remark-images-uplyfile-cache", uplyfileSeverListCache)
+
+    }
+
+    const generateImagesAndUpdateNode = async function(node, resolve, inLink, uplyfileSeverListCache) {
         // Check if this markdownNode has a File parent. This plugin
         // won't work if the image isn't hosted locally.
         const parentNode = getNode(markdownNode.parent)
         let imagePath
+
+        console.log("node.url", node.url)
+
         if (parentNode && parentNode.dir) {
             imagePath = slash(path.join(parentNode.dir, node.url))
         } else {
@@ -49,212 +107,205 @@ module.exports = async (
             return resolve()
         }
 
-        let fluidResult = await fluid({
-            file: imageNode,
-            args: options,
-            reporter,
-            cache,
+        imageNode.internal.contentDigest
+
+        let url = uplyfileSeverListCache[imageNode.internal.contentDigest];
+
+        var imageUplyfile = null
+        for (let i in imageNode.children){
+            let childUID = imageNode.children[i]
+            let childNode = getNode(childUID)
+            if (childNode.internal.type == "ImageUplyfile") {
+                imageUplyfile = childNode
+                break;
+            }
+        }
+        console.log("imageNode", imageNode)
+        console.log("imageUplyfile", imageUplyfile)
+
+        var imageDimentions = getImageDimentions(imageNode.absolutePath)
+
+        let fluidResult = await fluid(url, {
+            maxWidth: pluginOptions.maxWidth,
+            width: imageDimentions.width,
+            height: imageDimentions.height,
+            imageWidth: imageDimentions.width,
         })
 
-        if (!fluidResult) {
-            return resolve()
-        }
+        console.log("fluidResult", fluidResult)
 
-        const originalImg = fluidResult.originalImg
-        const fallbackSrc = fluidResult.src
-        const srcSet = fluidResult.srcSet
-        const presentationWidth = fluidResult.presentationWidth
+        return `<img src="${url.full}" srcSet="${fluidResult.srcSet}" sizes="${fluidResult.sizes}">`
 
-        // Generate default alt tag
-        const srcSplit = node.url.split(`/`)
-        const fileName = srcSplit[srcSplit.length - 1]
-        const fileNameNoExt = fileName.replace(/\.[^/.]+$/, ``)
-        const defaultAlt = fileNameNoExt.replace(/[^A-Z0-9]/gi, ` `)
+    //     let fluidResult = await fluid({
+    //         file: imageNode,
+    //         args: options,
+    //         reporter,
+    //         cache,
+    //     })
 
-        const imageStyle = `
-            width: 100%;
-            height: 100%;
-            margin: 0;
-            vertical-align: middle;
-            position: absolute;
-            top: 0;
-            left: 0;
-            box-shadow: inset 0px 0px 0px 400px ${options.backgroundColor};`.replace(
-            /\s*(\S+:)\s*/g,
-            `$1`
-        )
+    //     if (!fluidResult) {
+    //         return resolve()
+    //     }
 
-        // Create our base image tag
-        let imageTag = `
-            <img
-                class="${imageClass}"
-                style="${imageStyle}"
-                alt="${node.alt ? node.alt : defaultAlt}"
-                title="${node.title ? node.title : ``}"
-                src="${fallbackSrc}"
-                srcset="${srcSet}"
-                sizes="${fluidResult.sizes}"
-            />
-        `.trim()
+    //     const originalImg = fluidResult.originalImg
+    //     const fallbackSrc = fluidResult.src
+    //     const srcSet = fluidResult.srcSet
+    //     const presentationWidth = fluidResult.presentationWidth
 
-        // if options.withWebp is enabled, generate a webp version and change the image tag to a picture tag
-        if (options.withWebp) {
-            const webpFluidResult = await fluid({
-                file: imageNode,
-                args: _.defaults(
-                    { toFormat: `WEBP` },
-                    // override options if it's an object, otherwise just pass through defaults
-                    options.withWebp === true ? {} : options.withWebp,
-                    pluginOptions,
-                    defaults
-                ),
-                reporter,
-            })
+    //     // Generate default alt tag
+    //     const srcSplit = node.url.split(`/`)
+    //     const fileName = srcSplit[srcSplit.length - 1]
+    //     const fileNameNoExt = fileName.replace(/\.[^/.]+$/, ``)
+    //     const defaultAlt = fileNameNoExt.replace(/[^A-Z0-9]/gi, ` `)
 
-            if (!webpFluidResult) {
-                return resolve()
-            }
+    //     const imageStyle = `
+    //         width: 100%;
+    //         height: 100%;
+    //         margin: 0;
+    //         vertical-align: middle;
+    //         position: absolute;
+    //         top: 0;
+    //         left: 0;
+    //         box-shadow: inset 0px 0px 0px 400px ${options.backgroundColor};`.replace(
+    //         /\s*(\S+:)\s*/g,
+    //         `$1`
+    //     )
 
-            imageTag = `
-            <picture>
-                <source
-                    srcset="${webpFluidResult.srcSet}"
-                    sizes="${webpFluidResult.sizes}"
-                    type="${webpFluidResult.srcSetType}"
-                />
-                <source
-                    srcset="${srcSet}"
-                    sizes="${fluidResult.sizes}"
-                    type="${fluidResult.srcSetType}"
-                />
-                <img
-                    class="${imageClass}"
-                    style="${imageStyle}"
-                    src="${fallbackSrc}"
-                    alt="${node.alt ? node.alt : defaultAlt}"
-                    title="${node.title ? node.title : ``}"
-                />
-            </picture>
-            `.trim()
-        }
+    //     // Create our base image tag
+    //     let imageTag = `
+    //         <img
+    //             class="${imageClass}"
+    //             style="${imageStyle}"
+    //             alt="${node.alt ? node.alt : defaultAlt}"
+    //             title="${node.title ? node.title : ``}"
+    //             src="${fallbackSrc}"
+    //             srcset="${srcSet}"
+    //             sizes="${fluidResult.sizes}"
+    //         />
+    //     `.trim()
 
-        const ratio = `${(1 / fluidResult.aspectRatio) * 100}%`
+    //     // if options.withWebp is enabled, generate a webp version and change the image tag to a picture tag
+    //     if (options.withWebp) {
+    //         const webpFluidResult = await fluid({
+    //             file: imageNode,
+    //             args: _.defaults(
+    //                 { toFormat: `WEBP` },
+    //                 // override options if it's an object, otherwise just pass through defaults
+    //                 options.withWebp === true ? {} : options.withWebp,
+    //                 pluginOptions,
+    //                 defaults
+    //             ),
+    //             reporter,
+    //         })
 
-        // Construct new image node w/ aspect ratio placeholder
-        const showCaptions = options.showCaptions && node.title
-        let rawHTML = `
-    <span
-        class="${imageWrapperClass}"
-        style="position: relative; display: block; ${
-            showCaptions ? `` : options.wrapperStyle
-        } max-width: ${presentationWidth}px; margin-left: auto; margin-right: auto;"
-    >
-        <span
-            class="${imageBackgroundClass}"
-            style="padding-bottom: ${ratio}; position: relative; bottom: 0; left: 0; background-image: url('${
-            fluidResult.base64
-        }'); background-size: cover; display: block;"
-        ></span>
-        ${imageTag}
-    </span>
-    `.trim()
+    //         if (!webpFluidResult) {
+    //             return resolve()
+    //         }
 
-        // Make linking to original image optional.
-        if (!inLink && options.linkImagesToOriginal) {
-            rawHTML = `
-    <a
-        class="gatsby-resp-image-link"
-        href="${originalImg}"
-        style="display: block"
-        target="_blank"
-        rel="noopener"
-    >
-        ${rawHTML}
-    </a>
-        `.trim()
-        }
+    //         imageTag = `
+    //         <picture>
+    //             <source
+    //                 srcset="${webpFluidResult.srcSet}"
+    //                 sizes="${webpFluidResult.sizes}"
+    //                 type="${webpFluidResult.srcSetType}"
+    //             />
+    //             <source
+    //                 srcset="${srcSet}"
+    //                 sizes="${fluidResult.sizes}"
+    //                 type="${fluidResult.srcSetType}"
+    //             />
+    //             <img
+    //                 class="${imageClass}"
+    //                 style="${imageStyle}"
+    //                 src="${fallbackSrc}"
+    //                 alt="${node.alt ? node.alt : defaultAlt}"
+    //                 title="${node.title ? node.title : ``}"
+    //             />
+    //         </picture>
+    //         `.trim()
+    //     }
 
-        // Wrap in figure and use title as caption
-        if (showCaptions) {
-            rawHTML = `
-    <figure class="gatsby-resp-image-figure" style="${options.wrapperStyle}">
-        ${rawHTML}
-        <figcaption class="gatsby-resp-image-figcaption">${node.title}</figcaption>
-    </figure>
-            `.trim()
-        }
+    //     const ratio = `${(1 / fluidResult.aspectRatio) * 100}%`
 
-        return rawHTML
+    //     // Construct new image node w/ aspect ratio placeholder
+    //     const showCaptions = options.showCaptions && node.title
+    //     let rawHTML = `
+    // <span
+    //     class="${imageWrapperClass}"
+    //     style="position: relative; display: block; ${
+    //         showCaptions ? `` : options.wrapperStyle
+    //     } max-width: ${presentationWidth}px; margin-left: auto; margin-right: auto;"
+    // >
+    //     <span
+    //         class="${imageBackgroundClass}"
+    //         style="padding-bottom: ${ratio}; position: relative; bottom: 0; left: 0; background-image: url('${
+    //         fluidResult.base64
+    //     }'); background-size: cover; display: block;"
+    //     ></span>
+    //     ${imageTag}
+    // </span>
+    // `.trim()
+
+    //     // Make linking to original image optional.
+    //     if (!inLink && options.linkImagesToOriginal) {
+    //         rawHTML = `
+    // <a
+    //     class="gatsby-resp-image-link"
+    //     href="${originalImg}"
+    //     style="display: block"
+    //     target="_blank"
+    //     rel="noopener"
+    // >
+    //     ${rawHTML}
+    // </a>
+    //     `.trim()
+    //     }
+
+    //     // Wrap in figure and use title as caption
+    //     if (showCaptions) {
+    //         rawHTML = `
+    // <figure class="gatsby-resp-image-figure" style="${options.wrapperStyle}">
+    //     ${rawHTML}
+    //     <figcaption class="gatsby-resp-image-figcaption">${node.title}</figcaption>
+    // </figure>
+    //         `.trim()
+    //     }
+
+    //     return rawHTML
     }
 
-    console.log("rawHtmlNodes", rawHtmlNodes)
+    // console.log("rawHtmlNodes", rawHtmlNodes)
 
-    rawHtmlNodes.map(({ node, inLink }) => {
-        new Promise(async (resolve, reject) => {
-            console.log("node.value", node.value)
-            if (!node.value) {
-                return resolve()
-            }
+    markdownImageNodes.map(
+        ({ node, inLink }) =>
+            new Promise(async (resolve, reject) => {
+                const fileType = node.url.slice(-3)
 
-            const $ = cheerio.load(node.value)
-            if ($(`img`).length === 0) {
-                // No img tags
-                return resolve()
-            }
-
-            let imageRefs = []
-            $(`img`).each(function() {
-                imageRefs.push($(this))
-            })
-
-            console.log("imageRefs", imageRefs)
-
-
-            for (let thisImg of imageRefs) {
-                // Get the details we need.
-                let formattedImgTag = {}
-                formattedImgTag.url = thisImg.attr(`src`)
-                formattedImgTag.title = thisImg.attr(`title`)
-                formattedImgTag.alt = thisImg.attr(`alt`)
-
-                console.log("thisImg", thisImg)
-                console.log("formattedImgTag.url", formattedImgTag.url)
-
-                if (!formattedImgTag.url) {
-                    return resolve()
-                }
-
-                const fileType = formattedImgTag.url.slice(-3)
-                console.log("fileType", fileType)
-                console.log("isRelativeUrl(formattedImgTag.url)", isRelativeUrl(formattedImgTag.url))
                 // Ignore gifs as we can't process them,
                 // svgs as they are already responsive by definition
                 if (
-                    isRelativeUrl(formattedImgTag.url) &&
+                    isRelativeUrl(node.url) &&
                     fileType !== `gif` &&
                     fileType !== `svg`
                 ) {
-                    console.log("INSIDE IF")
                     const rawHTML = await generateImagesAndUpdateNode(
-                        formattedImgTag,
+                        node,
                         resolve,
-                        inLink
+                        inLink,
+                        uplyfileSeverListCache,
                     )
-                    console.log("rawHTML IN IF", rawHTML)
+
                     if (rawHTML) {
-                        // Replace the image string
-                        // thisImg.replaceWith(rawHTML)
-                        thisImg.replaceWith(rawHTML)
-
-                    } else {
-                        return resolve()
+                        // Replace the image node with an inline HTML node.
+                        node.type = `html`
+                        node.value = rawHTML
                     }
+                    return resolve(node)
+                } else {
+                    // Image isn't relative so there's nothing for us to do.
+                    return resolve()
                 }
-            }
-
-
-        })
-
-    })
+            })
+    )
 
 }
